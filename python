@@ -1,0 +1,357 @@
+import cv2
+import pandas as pd
+import os
+from datetime import datetime
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CAMERA_INDEX = 0
+LOCATION_NAME = "Main Gate"
+
+AUTHORIZED_FILE = r"authorizesfile.xlsx"
+LOG_FILE = r"bus.xlsx"
+
+COOLDOWN_SECONDS = 10
+recent_detected = {}
+
+qr_detector = cv2.QRCodeDetector()
+
+# -----------------------------
+# QR → BUS CODE MAPPING
+# -----------------------------
+QR_CODE_MAP = {
+    "HTTPS://Q.ME-QR.COM/N4ZA1UTP": "BUS001",
+    "HTTPS://Q.ME-QR.COM/QQXV2842": "BUS002",
+    "HTTPS://Q.ME-QR.COM/VNJ7PY5K": "BUS003",
+    "HTTPS://Q.ME-QR.COM/W9XR55MV": "BUS004"
+}
+
+# -----------------------------
+# INITIAL SETUP
+# -----------------------------
+def initialize_log_file():
+    folder = os.path.dirname(LOG_FILE)
+
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder)
+
+    if not os.path.exists(LOG_FILE):
+        df_log = pd.DataFrame(columns=[
+            "Bus Code",
+            "Bus Name",
+            "Entry Time",
+            "Exit Time",
+            "Location",
+            "Status"
+        ])
+        df_log.to_excel(LOG_FILE, index=False)
+
+def load_authorized_buses():
+    try:
+        df = pd.read_excel(AUTHORIZED_FILE, dtype=str)
+
+        df["Bus Code"] = (
+            df["Bus Code"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+        df["Bus Name"] = (
+            df["Bus Name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        return df[["Bus Code", "Bus Name"]]
+
+    except Exception as e:
+        print("ERROR reading authorized file:", e)
+        return pd.DataFrame(columns=["Bus Code", "Bus Name"])
+
+AUTHORIZED_BUSES = load_authorized_buses()
+
+def load_log_file():
+    try:
+        if not os.path.exists(LOG_FILE):
+            initialize_log_file()
+
+        df = pd.read_excel(LOG_FILE, dtype=str)
+
+        needed = [
+            "Bus Code",
+            "Bus Name",
+            "Entry Time",
+            "Exit Time",
+            "Location",
+            "Status"
+        ]
+
+        for col in needed:
+            if col not in df.columns:
+                df[col] = ""
+
+        df = df.fillna("")
+
+        return df[needed]
+
+    except Exception:
+        return pd.DataFrame(columns=[
+            "Bus Code",
+            "Bus Name",
+            "Entry Time",
+            "Exit Time",
+            "Location",
+            "Status"
+        ])
+
+def save_log_file(df):
+    try:
+        df.to_excel(LOG_FILE, index=False)
+    except PermissionError:
+        print("ERROR: Close bus_log.xlsx before scanning.")
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def normalize_qr_data(data):
+    data = data.strip().upper().rstrip("/")
+    return QR_CODE_MAP.get(data, "")
+
+def get_bus_name(code):
+    row = AUTHORIZED_BUSES[
+        AUTHORIZED_BUSES["Bus Code"] == code
+    ]
+
+    if not row.empty:
+        return row.iloc[0]["Bus Name"]
+
+    return ""
+
+def is_authorized_bus(code):
+    return code in AUTHORIZED_BUSES["Bus Code"].values
+
+def can_process_code(code):
+    now = datetime.now()
+
+    # Remove expired entries
+    expired = []
+
+    for k, t in recent_detected.items():
+        if (now - t).total_seconds() > COOLDOWN_SECONDS:
+            expired.append(k)
+
+    for k in expired:
+        del recent_detected[k]
+
+    if code in recent_detected:
+        return False
+
+    recent_detected[code] = now
+    return True
+
+# -----------------------------
+# ENTRY / EXIT LOGIC
+# -----------------------------
+def update_entry_exit_excel(bus_code):
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bus_name = get_bus_name(bus_code)
+
+    df_log = load_log_file()
+
+    bus_rows = df_log[df_log["Bus Code"] == bus_code]
+
+    # First scan = Entry
+    if bus_rows.empty:
+
+        new_row = {
+            "Bus Code": bus_code,
+            "Bus Name": bus_name,
+            "Entry Time": now,
+            "Exit Time": "",
+            "Location": LOCATION_NAME,
+            "Status": "Inside"
+        }
+
+        df_log = pd.concat(
+            [df_log, pd.DataFrame([new_row])],
+            ignore_index=True
+        )
+
+        save_log_file(df_log)
+
+        return "Entry recorded"
+
+    last_index = bus_rows.index[-1]
+    last_status = str(df_log.loc[last_index, "Status"]).strip()
+
+    # Inside → Exit
+    if last_status == "Inside":
+
+        df_log.loc[last_index, "Exit Time"] = now
+        df_log.loc[last_index, "Status"] = "Outside"
+
+        save_log_file(df_log)
+
+        return "Exit recorded"
+
+    # Outside → Entry
+    new_row = {
+        "Bus Code": bus_code,
+        "Bus Name": bus_name,
+        "Entry Time": now,
+        "Exit Time": "",
+        "Location": LOCATION_NAME,
+        "Status": "Inside"
+    }
+
+    df_log = pd.concat(
+        [df_log, pd.DataFrame([new_row])],
+        ignore_index=True
+    )
+
+    save_log_file(df_log)
+
+    return "Entry recorded"
+
+# -----------------------------
+# QR DETECTION
+# -----------------------------
+def scan_qr_codes(frame):
+
+    detected_codes = []
+
+    data, points, _ = qr_detector.detectAndDecode(frame)
+
+    if points is not None and data:
+
+        bus_code = normalize_qr_data(data)
+
+        if bus_code == "":
+            return detected_codes
+
+        pts = points.reshape(4, 2).astype(int)
+
+        x = min(pts[:, 0])
+        y = min(pts[:, 1])
+
+        w = max(pts[:, 0]) - x
+        h = max(pts[:, 1]) - y
+
+        detected_codes.append({
+            "raw_data": data,
+            "bus_code": bus_code,
+            "rect": (x, y, w, h)
+        })
+
+    return detected_codes
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+
+    initialize_log_file()
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    if not cap.isOpened():
+        print("Camera failed to open.")
+        return
+
+    print("================================")
+    print("Bus Entry/Exit Monitoring Started")
+    print("Press Q to Quit")
+    print("================================")
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            print("Camera Error!")
+            break
+
+        display_frame = frame.copy()
+        screen_text = "No QR Found"
+
+        try:
+
+            qr_results = scan_qr_codes(frame)
+
+            for item in qr_results:
+
+                raw = item["raw_data"]
+                code = item["bus_code"]
+
+                x, y, w, h = item["rect"]
+
+                screen_text = code
+
+                cv2.rectangle(
+                    display_frame,
+                    (x, y),
+                    (x + w, y + h),
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    display_frame,
+                    code,
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2
+                )
+
+                if can_process_code(code):
+
+                    if is_authorized_bus(code):
+
+                        result = update_entry_exit_excel(code)
+
+                        print(
+                            f"{raw} -> {code} -> {result}"
+                        )
+
+                    else:
+                        print(
+                            f"{raw} -> UNAUTHORIZED BUS"
+                        )
+
+        except Exception as e:
+            print("QR Scan Error:", e)
+
+        cv2.putText(
+            display_frame,
+            f"Scanned: {screen_text}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 0, 0),
+            2
+        )
+
+        cv2.imshow(
+            "Bus Entry Exit System",
+            display_frame
+        )
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# -----------------------------
+if __name__ == "__main__":
+    main()
